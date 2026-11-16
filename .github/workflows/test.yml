@@ -1,0 +1,58 @@
+# What this package can be checked for without Google: everything but the
+# answers themselves. Every request goes through one function the tests answer
+# from tables in the shapes Google's documentation gives (see the tests'
+# docstrings), so nothing here needs a key or the network.
+#
+# Nightly as well as on a push, because the plugin is written against PartCAD's
+# plugin toolkit -- `plugin_models`, which reads a key the way PartCAD writes
+# it, and `plugin_login`, which 'pc login' answers -- and that lives in a
+# package with a release cycle of its own. Only those files are needed, so
+# PartCAD is installed without its CAD stack, from `devel`: a change there
+# that moves the contract should fail here before it is released.
+name: Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "0 5 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The ends of what PartCAD supports.
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          # PartCAD's wrappers, which 'conftest.py' finds in the installed
+          # package -- and nothing of what they would need to build a part.
+          python -m pip install --no-deps "partcad @ git+https://github.com/partcad/partcad@devel"
+          # What the plugin itself needs: numpy for the grids and the meshes,
+          # and DracoPy for Google's Draco-compressed tiles, as the package's
+          # 'pythonRequirements' asks the sandbox for it.
+          python -m pip install pytest numpy "DracoPy==2.1.0"
+
+      - name: Run the tests
+        run: pytest -v

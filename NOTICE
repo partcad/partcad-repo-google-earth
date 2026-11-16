@@ -1,0 +1,19 @@
+partcad-repo-google-earth
+=========================
+
+This PartCAD package serves places in Google Earth as PartCAD parts.
+
+The code in this repository (the `google_earth_repo.py` repository plugin, the
+`earth.py` it reads Google with, the PartCAD configuration and the tests) is:
+
+    Copyright 2026 PartCAD
+    Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+No data of Google's is included in this repository, and none is kept by it.
+Elevations, 3D tiles and geocoding results are fetched when a part is built,
+with the Google Maps Platform API key of whoever builds it, and remain
+Google's, under the Google Maps Platform Terms of Service
+(https://cloud.google.com/maps-platform/terms) that key was issued under.
+
+Google, Google Earth and Google Maps are trademarks of Google LLC. This package
+is not affiliated with or endorsed by Google.

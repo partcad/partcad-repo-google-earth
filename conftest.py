@@ -10,8 +10,7 @@ reads a key PartCAD did not take apart with 'plugin_models.query_of', and is
 asked to log in through 'plugin_login'. The tests do the same: from
 $PARTCAD_WRAPPERS when it is set, else from the 'partcad' that is installed
 ('pip install --no-deps partcad' is enough: only the files are needed), else
-from a PartCAD checkout - the one this package is incubated in, or one beside
-it.
+from a PartCAD checkout beside this one.
 """
 
 import importlib.util
@@ -31,12 +30,12 @@ def _wrappers():
         spec = None
     if spec is not None and spec.origin:
         return os.path.join(os.path.dirname(spec.origin), "wrappers")
-    # A PartCAD checkout: the one this package is incubated in, or one beside this checkout.
-    for checkout in (os.path.join(_HERE, os.pardir, os.pardir), os.path.join(_HERE, os.pardir, "partcad")):
+    # A PartCAD checkout beside this one.
+    for checkout in (os.path.join(_HERE, os.pardir, "partcad"),):
         wrappers = os.path.join(checkout, "src", "partcad", "wrappers")
         if os.path.exists(os.path.join(wrappers, "plugin_models.py")):
             return wrappers
-    return os.path.join(_HERE, os.pardir, os.pardir, "src", "partcad", "wrappers")
+    return os.path.join(_HERE, os.pardir, "partcad", "src", "partcad", "wrappers")
 
 
 _PATH = os.path.abspath(_wrappers())

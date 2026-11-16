@@ -94,9 +94,16 @@ Every part carries a link to the place in Google Earth (`url`) and Google's attr
 ## Tests
 
 ```shell
-pip install partcad pytest DracoPy==2.1.0
+pip install --no-deps partcad    # PartCAD's plugin toolkit: only its files are needed
+pip install pytest numpy DracoPy==2.1.0
 pytest
 ```
 
-Nothing in them touches the network. Without DracoPy the one test of a Draco-compressed tile
-is skipped.
+Nothing in them touches the network, and no key is needed: every request goes through one
+function, which the tests answer from tables in the shapes Google's documentation gives. Without
+DracoPy the one test of a Draco-compressed tile is skipped. CI runs them on every push and nightly,
+against PartCAD's `devel`.
+
+## License
+
+Apache 2.0 (see `LICENSE`). The data is Google's, fetched with your key and kept nowhere: see `NOTICE`.
