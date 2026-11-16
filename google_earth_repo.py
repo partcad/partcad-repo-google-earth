@@ -36,9 +36,11 @@ in millimetres: how far above z = 0 the lowest of the surface stands. A search (
 three parts of the place found.
 """
 
+import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -56,11 +58,25 @@ ATTRIBUTION = (
     "Map data and imagery: Google. Fetched with your own Google Maps Platform key, under its terms (%s)." % TERMS
 )
 
+CONSOLE = "https://console.cloud.google.com"
+CREDENTIALS = CONSOLE + "/google/maps-apis/credentials"
+BILLING = CONSOLE + "/billing/linkedaccount"
+LOGIN = "pc login //pub/collection/google-earth:google_earth_repo"
+
+# The APIs a key is used with: what each is for here, the Cloud service that is it, and whether a part needs it.
+# Every part needs its data; only a search needs a place's name made a place.
+APIS = (
+    ("Elevation API", "elevation-backend.googleapis.com", "the ground ('elevation' parts)", True),
+    ("Map Tiles API", "tile.googleapis.com", "what stands on it ('surface' and 'tiles' parts)", True),
+    ("Geocoding API", "geocoding-backend.googleapis.com", "finding a place by its name ('pc search')", False),
+)
+
 KEY_INSTRUCTIONS = (
-    "Use a Google Maps Platform API key of your own: in the Google Cloud console "
-    "(https://console.cloud.google.com/google/maps-apis/credentials) create a project with billing, enable the "
-    "Elevation API, the Map Tiles API and the Geocoding API, create an API key and restrict it to those three. "
-    "Its use is under Google's terms (%s), which you accept for yourself." % TERMS
+    "A Google Maps Platform API key of your own, from a Google Cloud project with billing: in the Google Cloud "
+    "console (%s), pick or create a project, enable the Elevation API, the Map Tiles API and the Geocoding API "
+    "for it, create an API key (Create credentials, API key), and restrict it to those three APIs. Its use is "
+    "under Google's terms (%s), which you accept for yourself. The key can also be given as GOOGLE_MAPS_API_KEY "
+    "in the environment the plugin runs in." % (CREDENTIALS, TERMS)
 )
 
 
@@ -70,8 +86,20 @@ def http(url):
         with urllib.request.urlopen(request, timeout=120) as response:
             return response.read()
     except urllib.error.HTTPError as e:
-        body = e.read()[:500].decode("utf-8", "replace")
-        raise earth.EarthError("Google answered HTTP %d for %s: %s" % (e.code, url.split("?")[0], body))
+        body = e.read()[:2000].decode("utf-8", "replace")
+        reason = None
+        try:
+            for detail in json.loads(body).get("error", {}).get("details", []):
+                reason = reason or detail.get("reason")
+        except (ValueError, AttributeError):
+            pass
+        raise earth.EarthError(
+            "Google answered HTTP %d for %s%s" % (e.code, url.split("?")[0], " (%s)" % reason if reason else ""),
+            status=e.code,
+            reason=reason,
+        )
+    except (urllib.error.URLError, OSError) as e:
+        raise earth.EarthError("Google could not be reached at %s: %s" % (url.split("?")[0], e), status="UNREACHABLE")
 
 
 def api_key(request):
@@ -301,29 +329,163 @@ def get(request):
     return None
 
 
-def check(key):
-    """Whether Google takes the key: one height, of the place the key is asked about least."""
-    earth.elevations([(0.0, 0.0)], key, http)
-    return True
+# -- Logging in ----------------------------------------------------------------------------------------------------
+#
+# A key is enough for Google to say which of its APIs it can use, and why not: so 'pc login' asks each of the
+# three, says what is missing and where to fix it, and walks the user through the console where they have none.
+
+
+def library(service):
+    return "%s/apis/library/%s" % (CONSOLE, service)
+
+
+def ask_api(name, key):
+    """Ask one API one cheap question with the key: the EarthError Google answered, or None if it answered."""
+    try:
+        if name == "Elevation API":
+            earth.elevations([(0.0, 0.0)], key, http)
+        elif name == "Geocoding API":
+            earth.geocode("Greenwich", key, http)
+        else:
+            http(earth._with_key(earth.TILES_ROOT, key, None))
+    except earth.EarthError as e:
+        return e
+    return None
+
+
+def problem(name, service, error):
+    """(what is wrong, how to fix it) for an API's answer to a key: what a person can act on, with the page."""
+    status, reason = str(error.status or ""), str(error.reason or "")
+    said = reason.lower()
+    if status == "UNREACHABLE":
+        return "unreachable", "Google could not be reached: %s" % error
+    if reason in ("API_KEY_INVALID",) or "api key is invalid" in said or "api key not valid" in said:
+        return "invalid", "Google does not know the key: make one at %s" % CREDENTIALS
+    if reason == "SERVICE_DISABLED" or "not activated" in said or "has not been used" in said or "is disabled" in said:
+        return "disabled", "it is not enabled for the key's project: enable it at %s" % library(service)
+    if reason == "API_KEY_SERVICE_BLOCKED" or "not authorized to use this service" in said:
+        return "restricted", "the key's API restrictions leave it out: allow it on the key at %s" % CREDENTIALS
+    if reason == "BILLING_DISABLED" or "billing" in said or status == "OVER_DAILY_LIMIT":
+        return "billing", "the key's project has no billing account: link one at %s" % BILLING
+    if status in ("OVER_QUERY_LIMIT", "429") or reason == "RATE_LIMIT_EXCEEDED":
+        return "quota", "it is over its quota just now: try again shortly"
+    return "denied", (
+        "Google refuses the key for it (%s): enable it for the key's project at %s, allow it in the key's API "
+        "restrictions at %s, and check that the project has billing"
+        % (reason or status or error, library(service), CREDENTIALS)
+    )
+
+
+def diagnose(key):
+    """[(api, service, purpose, required, None or (kind, fix))] for each API the plugin uses."""
+    found = []
+    for name, service, purpose, required in APIS:
+        error = ask_api(name, key)
+        found.append((name, service, purpose, required, problem(name, service, error) if error else None))
+    return found
+
+
+def report(found):
+    """What the key cannot do yet, a line an API - or one line, when every API says the same - or ''."""
+    failing = [f for f in found if f[4]]
+    if len(failing) > 1 and len(failing) == len(found) and len({f[4] for f in failing}) == 1:
+        return "  every API: %s" % failing[0][4][1]
+    return "\n".join("  %s, for %s: %s" % (name, purpose, fix) for name, _, purpose, _, (kind, fix) in failing)
+
+
+def usable(found):
+    """Whether every API a part needs answers the key."""
+    return all(problem is None for _, _, _, required, problem in found if required)
+
+
+def guide_steps():
+    """What the browser spotlights on the console's pages, step by step, while the user sets the key up."""
+    steps = []
+    for name, service, purpose, _ in APIS:
+        steps.append(
+            {
+                "url": library(service) + "*",
+                "selector": "button",
+                "contains": r"^\s*Enable\s*$",
+                "text": "Enable the %s, for %s. Then open the next API, or Credentials." % (name, purpose),
+            }
+        )
+    for page in (CREDENTIALS, CONSOLE + "/apis/credentials"):
+        steps.append(
+            {
+                "url": page + "*",
+                "selector": "button",
+                "contains": r"Create credentials",
+                "text": "Create an API key (or use one you have), restrict it to the Elevation, Map Tiles and "
+                "Geocoding APIs, and paste it in the bar above.",
+            }
+        )
+    return steps
+
+
+def instructions_for(key, found):
+    """What to do, in words, for whoever has no browser: the key's state where there is one, and the steps."""
+    lines = []
+    if key and found:
+        missing = report(found)
+        if missing:
+            lines.append("The key you have cannot be used yet:\n" + missing)
+    lines.append(KEY_INSTRUCTIONS)
+    lines.append(
+        "Enable each API at its page: %s."
+        % ", ".join("%s %s" % (name, library(service)) for name, service, _, _ in APIS)
+    )
+    return "\n\n".join(lines)
+
+
+def outcome(key, found, how):
+    """The login's answer for a key Google was asked about: saved, with what is still missing, or refused."""
+    if usable(found):
+        missing = report(found)
+        message = "%s: Google takes the key for the Elevation and Map Tiles APIs" % how
+        if missing:
+            message += "; not yet for:\n" + missing
+        return {"parameters": {"api_key": key}, "message": message}
+    raise earth.EarthError(
+        "Google does not take the key yet for:\n%s\n\nFix those in the Google Cloud console, then run '%s' again "
+        "(or hand the key over with '%s --set api_key=<key>')." % (report(found), LOGIN, LOGIN)
+    )
 
 
 def login(request, partcad_login):
+    """'pc login': the key there is, if Google takes it; else the console, walked through, and the key it gives.
+
+    Before the browser is asked for, only what the key there is says decides
+    anything: the browser's answer is replayed into a run from the top (see
+    PartCAD's 'plugin_login'), so this must ask for it the same way each time.
+    """
     key = ((request.get("parameters") or {}).get("api_key") or os.environ.get("GOOGLE_MAPS_API_KEY") or "").strip()
-    if key:
-        try:
-            check(key)
-            return {"parameters": {"api_key": key}, "message": "Google takes the key you have"}
-        except earth.EarthError:
-            pass
+    found = diagnose(key) if key else []
+    if key and usable(found):
+        return outcome(key, found, "Logged in")
+    if key and getattr(partcad_login, "check", False):
+        return outcome(key, found, "Logged in")  # a check opens nothing: it says what is missing
+    invalid = any(f[4] and f[4][0] == "invalid" for f in found)
+    first = next((f for f in found if f[4] and f[4][0] == "disabled"), None)
+    # Where to start: the first API to enable, for a key Google knows; making a key, for none.
+    url = library(first[1]) if (key and not invalid and first) else CREDENTIALS
     got = partcad_login.open_browser(
-        url="https://console.cloud.google.com/google/maps-apis/credentials",
+        url=url,
         title="Google Maps Platform",
-        capture=[{"name": "api_key", "ask": {"label": "Your Google Maps Platform API key", "secret": True}}],
-        instructions=KEY_INSTRUCTIONS,
+        capture=[
+            {
+                "name": "api_key",
+                "ask": {"label": "Your Google Maps Platform API key, once its APIs are enabled", "secret": True},
+                # A Google API key: 'AIza' and 35 more. Anything else pasted there is not one.
+                "match": r"^AIza[0-9A-Za-z_\-]{35}$",
+            }
+        ],
+        guide=guide_steps(),
+        instructions=instructions_for(key, found),
+        timeout=1800,
     )
     key = (got.get("api_key") or "").strip()
-    check(key)
-    return {"parameters": {"api_key": key}, "message": "Logged in: Google takes the key"}
+    return outcome(key, diagnose(key), "Logged in")
 
 
 if __name__ in ("get", "login"):

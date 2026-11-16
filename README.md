@@ -19,17 +19,41 @@ mesh (`visual: tiles`).
 
 ## Setting it up
 
-In the [Google Cloud console](https://console.cloud.google.com/google/maps-apis/credentials):
-create a project with billing, enable the **Elevation API**, the **Map Tiles API** and the
-**Geocoding API**, create an API key, and restrict it to those three. Then:
-
 ```shell
 pc login //pub/collection/google-earth:google_earth_repo
 ```
 
-which asks for the key (or `pc login --agent ... --set api_key=...`, or `GOOGLE_MAPS_API_KEY` in
-the environment the plugin runs in) and checks that Google takes it. PartCAD keeps it in your
-`~/.partcad/config.yaml`, never in a package.
+walks you through it. You need a Google Cloud project with billing, the **Elevation API** and the
+**Map Tiles API** enabled for it (and the **Geocoding API**, for `pc search`), and an API key of
+that project allowed to use them. `pc login`:
+
+1. **asks Google about the key you have** - the one it saved before, or `GOOGLE_MAPS_API_KEY` in the
+   environment the plugin runs in - one cheap request to each of the three APIs, and keeps it if
+   the Elevation and Map Tiles APIs answer;
+2. **otherwise opens the Google Cloud console** in PartCAD's browser - at the first API the key's
+   project has not enabled, or at Credentials where there is no key Google knows - and points at
+   what to press on each page: **Enable** on each API's page, **Create credentials** for a key. When
+   you have one, paste it into PartCAD's bar (only a Google API key, `AIza...`, is taken);
+3. **asks Google about that key**, and keeps it - or says, API by API, what is still wrong and the
+   page that fixes it:
+
+```text
+Google does not take the key yet for:
+  Elevation API, for the ground ('elevation' parts): it is not enabled for the key's project:
+    enable it at https://console.cloud.google.com/apis/library/elevation-backend.googleapis.com
+  Geocoding API, for finding a place by its name ('pc search'): the key's API restrictions leave
+    it out: allow it on the key at https://console.cloud.google.com/google/maps-apis/credentials
+```
+
+A key the Geocoding API refuses is kept all the same, with that said: parts work, and only a
+search waits for it.
+
+`pc login --check` asks Google about the key you have and opens nothing. With nobody at the screen
+(`pc login --agent`, or an agent through `pc mcp`), `pc login` prints the same steps and links,
+with what is wrong with the key there is, and takes the key with `--set api_key=<key>`.
+
+PartCAD keeps the key in your `~/.partcad/config.yaml`, never in a package. Every request sends it
+to Google as the `key` parameter.
 
 ## Using it
 
@@ -84,8 +108,9 @@ Every part carries a link to the place in Google Earth (`url`) and Google's attr
 
 ## What it cannot do (yet)
 
-* **Untested against Google.** The tests answer Google from tables, in the shapes Google's
-  documentation gives; nothing here has fetched a real place yet.
+* **No place fetched from Google yet.** `pc login`'s checks have been run against Google, with a
+  key whose project had not yet enabled the APIs, which is how its refusals are worded here; the
+  data requests are tested against tables in the shapes Google's documentation gives.
 * **One mesh, no textures.** Google's tiles are textured; `tiles` is their geometry only.
 * **At most 600 tiles a place** (`earth.MAX_TILES`): a few hundred metres at a metre's error.
   A larger place needs a larger `error`.

@@ -14,6 +14,7 @@ import base64
 import io
 import json
 import os
+import re
 import runpy
 import urllib.parse
 
@@ -37,14 +38,57 @@ def run(api, request, partcad_login=None):
     return runpy.run_path(SCRIPT, init_globals=init, run_name=api)["output"]
 
 
-@pytest.fixture
-def google(monkeypatch):
-    """The plugin's 'http', answered by whichever of the tests' Googles a URL is for."""
-    elevation, tiles, asked = test_earth.Elevation(), test_earth.Tiles(), []
+@pytest.fixture(autouse=True)
+def no_key_of_the_machine(monkeypatch):
+    """A key in the environment the tests run in is somebody's: no test reads it, or asks Google with it."""
+    monkeypatch.delenv("GOOGLE_MAPS_API_KEY", raising=False)
+
+
+class Asked(list):
+    """The URLs the plugin asked, and what each API is to refuse the key with: {api: refusal}."""
+
+    def __init__(self):
+        super().__init__()
+        self.refuse = {}
+
+
+# How Google refuses a key, in its own shapes: a Maps web service's answer, and the Map Tiles API's error.
+NOT_ACTIVATED = {
+    "status": "REQUEST_DENIED",
+    "error_message": "This API is not activated on your API project. You may need to enable this API in the Google "
+    "Cloud Console: https://console.cloud.google.com/apis/library?filter=category:maps.",
+    "results": [],
+}
+NOT_AUTHORIZED = {
+    "status": "REQUEST_DENIED",
+    "error_message": "This API key is not authorized to use this service or API. Please check the API restrictions "
+    "settings of your API key in the Google Cloud Console.",
+    "results": [],
+}
+INVALID = {"status": "REQUEST_DENIED", "error_message": "The provided API key is invalid. ", "results": []}
+
+
+def tiles_refusal(code, reason):
+    def refuse():
+        raise plugin["earth"].EarthError("Google answered HTTP %d" % code, status=code, reason=reason)
+
+    return refuse
+
+
+def google_fixture(monkeypatch):
+    elevation, tiles, asked = test_earth.Elevation(), test_earth.Tiles(), Asked()
 
     def http(url):
         asked.append(url)
         host = urllib.parse.urlsplit(url).netloc
+        for api, prefix in (
+            ("Elevation API", plugin["earth"].ELEVATION_API),
+            ("Geocoding API", plugin["earth"].GEOCODING_API),
+            ("Map Tiles API", "https://tile.googleapis.com/"),
+        ):
+            refusal = asked.refuse.get(api)
+            if refusal is not None and url.startswith(prefix):
+                return refusal() if callable(refusal) else json.dumps(refusal).encode()
         if url.startswith(plugin["earth"].ELEVATION_API):
             return elevation(url)
         if url.startswith(plugin["earth"].GEOCODING_API):
@@ -60,6 +104,12 @@ def google(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: pytest.fail("the network was asked: %s" % (a,)))
     monkeypatch.delenv("GOOGLE_MAPS_API_KEY", raising=False)
     return asked
+
+
+@pytest.fixture
+def google(monkeypatch):
+    """The plugin's 'http', answered by whichever of the tests' Googles a URL is for."""
+    return google_fixture(monkeypatch)
 
 
 def name_of(base, parameters):
@@ -172,24 +222,136 @@ def test_a_search_finds_a_place_by_its_name(google):
 
 
 def test_a_key_google_takes_is_kept(google):
-    login = plugin_login.LoginCallback({})
-    result = plugin["login"]({"parameters": {"api_key": "the-key"}}, login)
+    result = plugin["login"]({"parameters": {"api_key": "the-key"}}, plugin_login.LoginCallback({}))
+    assert result["parameters"] == {"api_key": "the-key"}
+    assert "Elevation and Map Tiles" in result["message"] and "not yet" not in result["message"]
+    # Each API was asked, once.
+    assert sum(url.startswith(plugin["earth"].ELEVATION_API) for url in google) == 1
+    assert sum(url.startswith(plugin["earth"].GEOCODING_API) for url in google) == 1
+    assert sum("3dtiles/root.json" in url for url in google) == 1
+
+
+def test_a_key_from_the_environment_is_kept(google, monkeypatch):
+    monkeypatch.setenv("GOOGLE_MAPS_API_KEY", "the-key")
+    result = plugin["login"]({"parameters": {}}, plugin_login.LoginCallback({}))
     assert result["parameters"] == {"api_key": "the-key"}
 
 
-def test_without_a_key_the_browser_is_asked_for_one():
+@pytest.mark.parametrize(
+    "status, reason, kind, page",
+    [
+        (
+            "REQUEST_DENIED",
+            NOT_ACTIVATED["error_message"],
+            "disabled",
+            "/apis/library/elevation-backend.googleapis.com",
+        ),
+        ("REQUEST_DENIED", NOT_AUTHORIZED["error_message"], "restricted", "/google/maps-apis/credentials"),
+        ("REQUEST_DENIED", INVALID["error_message"], "invalid", "/google/maps-apis/credentials"),
+        ("REQUEST_DENIED", "You must enable Billing on the Google Cloud Project", "billing", "/billing/"),
+        (403, "SERVICE_DISABLED", "disabled", "/apis/library/elevation-backend.googleapis.com"),
+        (403, "API_KEY_SERVICE_BLOCKED", "restricted", "/google/maps-apis/credentials"),
+        (400, "API_KEY_INVALID", "invalid", "/google/maps-apis/credentials"),
+        (403, "BILLING_DISABLED", "billing", "/billing/"),
+        (403, "ACCESS_DENIED", "denied", "/apis/library/elevation-backend.googleapis.com"),
+        ("OVER_QUERY_LIMIT", "", "quota", None),
+        ("UNREACHABLE", "", "unreachable", None),
+    ],
+)
+def test_each_refusal_is_said_with_where_to_fix_it(status, reason, kind, page):
+    error = plugin["earth"].EarthError("refused", status=status, reason=reason)
+    found_kind, fix = plugin["problem"]("Elevation API", "elevation-backend.googleapis.com", error)
+    assert found_kind == kind
+    if page:
+        assert page in fix
+
+
+def test_google_s_error_body_is_read_for_its_reason(monkeypatch):
+    import io
+    import urllib.error
+
+    body = json.dumps(
+        {
+            "error": {
+                "code": 403,
+                "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "SERVICE_DISABLED"}],
+            }
+        }
+    ).encode()
+
+    def refuse(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(plugin["urllib"].request, "urlopen", refuse)
+    with pytest.raises(plugin["earth"].EarthError) as e:
+        plugin["http"]("https://tile.googleapis.com/v1/3dtiles/root.json?key=the-key")
+    assert e.value.status == 403 and e.value.reason == "SERVICE_DISABLED"
+    assert "the-key" not in str(e.value)
+
+
+def test_a_key_that_cannot_search_yet_is_kept_and_says_so(google):
+    google.refuse["Geocoding API"] = NOT_AUTHORIZED
+    result = plugin["login"]({"parameters": {"api_key": "the-key"}}, plugin_login.LoginCallback({}))
+    assert result["parameters"] == {"api_key": "the-key"}
+    assert "Geocoding API" in result["message"] and "restrictions" in result["message"]
+
+
+def test_a_check_says_what_the_key_cannot_do_and_opens_nothing(google):
+    google.refuse["Map Tiles API"] = tiles_refusal(403, "SERVICE_DISABLED")
+    with pytest.raises(plugin["earth"].EarthError) as e:
+        plugin["login"]({"parameters": {"api_key": "the-key"}}, plugin_login.LoginCallback({"check": True}))
+    said = str(e.value)
+    assert "Map Tiles API" in said and "/apis/library/tile.googleapis.com" in said
+    assert "Elevation API" not in said
+
+
+def test_a_key_with_an_api_to_enable_is_walked_to_that_api(google):
+    google.refuse["Elevation API"] = NOT_ACTIVATED
+    with pytest.raises(plugin_login.BrowserNeeded) as e:
+        plugin["login"]({"parameters": {"api_key": "the-key"}}, plugin_login.LoginCallback({}))
+    assert e.value.spec["url"].endswith("/apis/library/elevation-backend.googleapis.com")
+
+
+def test_a_key_google_does_not_know_is_walked_to_making_one(google):
+    for api in ("Elevation API", "Geocoding API"):
+        google.refuse[api] = INVALID
+    google.refuse["Map Tiles API"] = tiles_refusal(400, "API_KEY_INVALID")
+    with pytest.raises(plugin_login.BrowserNeeded) as e:
+        plugin["login"]({"parameters": {"api_key": "the-key"}}, plugin_login.LoginCallback({}))
+    assert e.value.spec["url"].endswith("/google/maps-apis/credentials")
+
+
+def test_without_a_key_the_browser_is_asked_for_one_and_shown_the_way():
     with pytest.raises(plugin_login.BrowserNeeded) as e:
         run("login", {"parameters": {}}, plugin_login.LoginCallback({}))
     spec = e.value.spec
-    assert spec["url"].startswith("https://console.cloud.google.com/")
+    assert spec["url"] == "https://console.cloud.google.com/google/maps-apis/credentials"
     (capture,) = spec["capture"]
     assert capture["name"] == "api_key" and capture["ask"]["secret"] is True
+    # Only a Google API key is taken for one.
+    pattern = re.compile(capture["match"])
+    assert pattern.match("AIza" + "x" * 35) and not pattern.match("the-key")
+    # A step on each API's page and on the credentials page, each pointing at its button.
+    pages = [step["url"] for step in spec["guide"]]
+    for service in ("elevation-backend", "tile", "geocoding-backend"):
+        assert any("/apis/library/%s.googleapis.com" % service in page for page in pages)
+    assert any("/credentials" in page for page in pages)
 
 
 def test_with_nobody_at_the_screen_the_user_is_told_where_a_key_is_made():
     with pytest.raises(plugin_login.InstructionsNeeded) as e:
         run("login", {"parameters": {}}, plugin_login.LoginCallback({"non_interactive": True}))
-    assert "Elevation API" in e.value.spec["instructions"] and "terms" in e.value.spec["instructions"]
+    said = e.value.spec["instructions"]
+    assert "Elevation API" in said and "terms" in said
+    assert "/apis/library/tile.googleapis.com" in said and "GOOGLE_MAPS_API_KEY" in said
+
+
+def test_with_nobody_at_the_screen_a_key_s_problems_come_first(google):
+    google.refuse["Elevation API"] = NOT_ACTIVATED
+    with pytest.raises(plugin_login.InstructionsNeeded) as e:
+        plugin["login"]({"parameters": {"api_key": "the-key"}}, plugin_login.LoginCallback({"non_interactive": True}))
+    said = e.value.spec["instructions"]
+    assert said.startswith("The key you have cannot be used yet") and "elevation-backend" in said
 
 
 def test_the_key_the_browser_brings_back_is_checked_and_kept(google):
@@ -197,3 +359,13 @@ def test_the_key_the_browser_brings_back_is_checked_and_kept(google):
     result = plugin["login"]({"parameters": {}}, login)
     assert result["parameters"] == {"api_key": "the-key"} and "Logged in" in result["message"]
     assert any(url.startswith(plugin["earth"].ELEVATION_API) for url in google)
+
+
+def test_a_key_handed_over_that_google_refuses_is_not_kept(google):
+    for api in ("Elevation API", "Geocoding API"):
+        google.refuse[api] = INVALID
+    google.refuse["Map Tiles API"] = tiles_refusal(400, "API_KEY_INVALID")
+    with pytest.raises(plugin["earth"].EarthError) as e:
+        plugin["login"]({"parameters": {}}, plugin_login.LoginCallback({"values": {"api_key": "AIza" + "0" * 35}}))
+    # Every API says the same, so it is said once.
+    assert "every API: Google does not know the key" in str(e.value) and "--set api_key=" in str(e.value)

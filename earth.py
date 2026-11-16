@@ -50,7 +50,20 @@ E2 = 6.69437999014e-3
 
 
 class EarthError(Exception):
-    """What Google answered that is not the data, in words for the user."""
+    """What Google answered that is not the data, in words for the user.
+
+    'status' is Google's word for it where it said one - a Maps web service's
+    'status' ('REQUEST_DENIED'), or the HTTP status of the Map Tiles API - and
+    'reason' what it said besides: the web service's 'error_message', or the
+    Map Tiles API's 'ErrorInfo.reason' ('SERVICE_DISABLED',
+    'API_KEY_SERVICE_BLOCKED', ...). 'pc login' reads them to say which of a
+    key's APIs is not set up, and how to set it up ('google_earth_repo.problem').
+    """
+
+    def __init__(self, message, status=None, reason=None):
+        super().__init__(message)
+        self.status = status
+        self.reason = reason
 
 
 # -- Geodesy -----------------------------------------------------------------------------------------------------
@@ -127,7 +140,11 @@ def _checked(answer, what):
             "OVER_DAILY_LIMIT": "the key's project has no billing, or its quota is spent",
             "OVER_QUERY_LIMIT": "too many requests: try again shortly",
         }.get(status, "")
-        raise EarthError("%s: %s%s%s" % (what, status, ": " + said if said else "", " (%s)" % hint if hint else ""))
+        raise EarthError(
+            "%s: %s%s%s" % (what, status, ": " + said if said else "", " (%s)" % hint if hint else ""),
+            status=status,
+            reason=said,
+        )
     return answer
 
 
